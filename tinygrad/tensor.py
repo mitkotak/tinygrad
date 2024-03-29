@@ -605,10 +605,17 @@ class Tensor:
     ret = fxn.apply(self, axis=axis_)
     return ret if keepdim else ret.reshape(shape=shape)
 
+  def acc_dtype(self): return least_upper_dtype(self.dtype, dtypes.uint) if dtypes.is_unsigned(self.dtype) else \
+                              least_upper_dtype(self.dtype, dtypes.int) if (dtypes.is_int(self.dtype) or self.dtype==dtypes.bool) else \
+                              least_upper_dtype(self.dtype, dtypes.float)
   def sum(self, axis=None, keepdim=False, acc_dtype:Optional[DType]=None):
-    if acc_dtype is None: acc_dtype = least_upper_dtype(self.dtype, dtypes.uint) if dtypes.is_unsigned(self.dtype) else \
-                                      least_upper_dtype(self.dtype, dtypes.int) if (dtypes.is_int(self.dtype) or self.dtype==dtypes.bool) else \
-                                      least_upper_dtype(self.dtype, dtypes.float)
+    if acc_dtype is None: acc_dtype = self.acc_dtype()
+    # cast back to float16 or bfloat16 to match torch / jax behavior, but we use float for acc
+    output_dtype = self.dtype if self.dtype in (dtypes.float16, dtypes.bfloat16) else acc_dtype
+    return self.cast(acc_dtype)._reduce(mlops.Prod, axis, keepdim).cast(output_dtype)
+
+  def prod(self, axis=None, keepdim=False, acc_dtype:Optional[DType]=None):
+    if acc_dtype is None: acc_dtype = self.acc_dtype()
     # cast back to float16 or bfloat16 to match torch / jax behavior, but we use float for acc
     output_dtype = self.dtype if self.dtype in (dtypes.float16, dtypes.bfloat16) else acc_dtype
     return self.cast(acc_dtype)._reduce(mlops.Sum, axis, keepdim).cast(output_dtype)
@@ -782,20 +789,22 @@ class Tensor:
   def matmul(self, x:Tensor, reverse=False, acc_dtype:Optional[DType]=None) -> Tensor:
     return x.dot(self, acc_dtype=acc_dtype) if reverse else self.dot(x, acc_dtype=acc_dtype)
 
-  def _cumsum(self, axis:int=0, _first_zero=False) -> Tensor:
+  def _cum(self, fxn, axis:int=0, _first_zero=False, pad_val=0) -> Tensor:
     pl_sz = self.shape[axis] - int(not _first_zero and self.shape[axis] != 0)
-    return self.transpose(axis,-1).pad2d((pl_sz,0))._pool((self.shape[axis] or 1,)).sum(-1).transpose(axis,-1)
-  def cumsum(self, axis:int=0) -> Tensor:
+    return fxn(self.transpose(axis,-1).pad2d((pl_sz,0), pad_val)._pool((self.shape[axis] or 1,)), -1).transpose(axis,-1)
+  def cum(self, fxn, axis:int=0, pad_val=0) -> Tensor:
     # TODO: someday the optimizer will find this on it's own
-    # for now this is a two stage cumsum
+    # for now this is a two stage cum process
     SPLIT = 256
-    if self.shape[axis] <= SPLIT*2: return self._cumsum(axis)
+    if self.shape[axis] <= SPLIT*2: return self._cum(fxn, axis, pad_val=pad_val)
     ret = self.transpose(axis,-1).pad2d((round_up(self.shape[axis], SPLIT)-self.shape[axis], 0))
-    ret = ret.unflatten(-1, (-1, SPLIT))._cumsum(-1)
-    base_add = ret[..., -1]._cumsum(-1, _first_zero=True)[..., :-1]
+    ret = ret.unflatten(-1, (-1, SPLIT))._cum(fxn, -1, pad_val=pad_val)
+    base_add = ret[..., -1]._cum(-1, _first_zero=True, pad_val=pad_val)[..., :-1]
     base_add = base_add.unsqueeze(-1).expand(*base_add.shape, ret.shape[-1])
     def fix(x:Tensor): return x.flatten(start_dim=-2)[..., -self.shape[axis]:].transpose(axis,-1)
     return fix(ret) + fix(base_add)
+  def cumsum(self, axis:int=0) -> Tensor: return self.cum(Tensor.sum, axis, 0)
+  def cumprod(self, axis:int=0) -> Tensor: return self.cum(Tensor.prod, axis, 1)
 
   @staticmethod
   def _tri(r:sint, c:sint, k:int=0, **kwargs) -> Tensor:

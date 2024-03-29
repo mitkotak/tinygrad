@@ -54,6 +54,7 @@ class Linearizer(Kernel):
     assert all(0 <= x < len(info.shape) for x in reduceop.arg), "arg axis out of range"
     dtype = info.dtype
     if reduceop.op is ReduceOps.SUM: return 0.0 if dtypes.is_float(dtype) else 0
+    elif reduceop.op == ReduceOps.PROD: return 1.0 if dtypes.is_float(dtype) else 1
     elif reduceop.op is ReduceOps.MAX:
       if dtypes.is_int(dtype): return 0 if dtypes.is_unsigned(dtype) else -2**(dtype.itemsize*8-1)
       return -math.inf if dtypes.is_float(dtype) else False
@@ -417,7 +418,7 @@ class Linearizer(Kernel):
       return acc
 
     values = [self.ast_parse(v, acc, offs, loaded_buffers, loop_ctx=loop_ctx, cache=cache) for v in x.src]
-    ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX}
+    ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, ReduceOps.PROD:BinaryOps.MUL}
     if x.op in ops:
       ret: List[UOp] = []
       input_acc = acc[:]
